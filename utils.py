@@ -4,6 +4,7 @@ import scipy
 import cv2
 import jlc
 from jlc.voltools import arrow_navigation
+from collections import OrderedDict
 
 def gaussian_filter_no_border(input,sigma,**kwargs):
     kwargs['mode'] = 'constant'
@@ -135,16 +136,17 @@ def get_disc_2d(r,binarize=True):
     return out
 
 class FiberGraph:
-    def __init__(self, find_conn_func=None, binarize_func=None, image_size=None, radius=3):
+    def __init__(self, find_conn_func=None, binarize_func=None, image_size=None, radius=3, threshold=0.15):
         self.nodes = []
         self.edges = []
-        self.node_to_cc = []
-        self.cc_to_node = []
+        self.cc_to_nodes = []
 
         self.image_size = image_size
         self.XY = np.zeros((0,2))
         self.node_image = None
         self.radius = radius
+        self.debug = False
+        self.threshold = threshold
         
         if binarize_func is None:
             self.binarize_func = self.default_binarize_func
@@ -155,8 +157,11 @@ class FiberGraph:
             self.find_conn_func = self.default_find_conn_func
         else:
             self.find_conn_func = find_conn_func
-    
-    def add_node(self,x,y,timestep,conn=None,is_growing=None):
+        
+
+    def add_node(self,x,y,timestep,conn=None,growing=None):
+        xy_inbounds = 0<=int(np.round(x))<self.image_size[1] and 0<=int(np.round(y))<self.image_size[0]
+        assert xy_inbounds, f"node is out of bounds. image size={self.image_size}, x={x}, y={y}"
         if self.node_image is None and self.image_size is not None:
             self.node_image = np.zeros(self.image_size)
         if self.node_image is not None:
@@ -164,49 +169,51 @@ class FiberGraph:
         node = {"idx": len(self.nodes),
                 "x": x,
                 "y": y,
-                "timestep": timestep,
-                "is_growing": True if is_growing is None else is_growing}
+                "active": True,
+                "active_t": [timestep,int(1e10)],
+                "t": timestep,
+                "growing": True if growing is None else growing,
+                "bad_counter": 0,
+                "cc_idx": None,
+                "old_versions": {}}
         
         if conn is None and self.num_fibers()==0:
             conn = []
         if conn is None:
-            dist = np.linalg.norm(self.XY-np.array([x,y]),axis=1)
-            t = np.array([n["timestep"] for n in self.nodes])
-            conn = self.find_conn_func(dist,timestep,t)
+            conn = self.find_conn_func(self.XY,self.nodes,node,self.radius)
         if isinstance(conn,int):
             if isinstance(conn,int):
                 conn = [conn]
         assert isinstance(conn,list)
         
         for c in conn:
-            self.add_edge(node["idx"],c)
+            self.nodes[c]["conn"].append(node["idx"])
+            self.nodes[c]["growing"] = False
 
         node["conn"] = conn
         if len(conn)>0:
             node["root"] = False
-            self.node_to_cc.append(self.node_to_cc[conn[0]])
-            self.cc_to_node[self.node_to_cc[conn[0]]].append(node["idx"])
+            cc_idx = self.nodes[conn[0]]["cc_idx"]
+            self.cc_to_nodes[cc_idx].append(node["idx"])
         else:
             node["root"] = True
-            self.node_to_cc.append(len(self.cc_to_node))
-            self.cc_to_node.append([node["idx"]])
+            cc_idx = len(self.cc_to_nodes)
+            
+            self.cc_to_nodes.append([node["idx"]])
+        node["cc_idx"] = cc_idx
         self.nodes.append(node)
         self.XY = np.vstack((self.XY,[x,y]))
-
-    def add_edge(self,idx1,idx2):
-        self.edges.append((idx1,idx2))
-        self.nodes[idx2]["conn"].append(idx1)
-        self.nodes[idx2]["is_growing"] = False
 
     def __len__(self):
         return len(self.nodes)
 
     def num_fibers(self):
-        return len(self.cc_to_node)
+        return len(self.cc_to_nodes)
     
-    def plot(self,mpl_colors=True,color=None,plot_cc=None,max_time=None):
-        if max_time is None:
-            max_time = np.max([n["timestep"] for n in self.nodes])
+    def plot(self,mpl_colors=True,color=None,plot_cc=None,t=None):
+        if t is None:
+            t = np.max([n["t"] for n in self.nodes])
+        t_mask = [n["active_t"][0]<=t<=n["active_t"][1] for n in self.nodes]
         if plot_cc is None:
             plot_cc = np.arange(self.num_fibers())
         if mpl_colors:
@@ -219,36 +226,41 @@ class FiberGraph:
                     color = np.array([color]*self.num_fibers())
                 elif isinstance(color,(list,np.ndarray)):
                     assert len(color)==self.num_fibers(),"color list must have same length as number of fibers if color is array/list"
-        for cc_idx in range(len(self.cc_to_node)):
+        for cc_idx in range(len(self.cc_to_nodes)):
             if cc_idx in plot_cc:
                 edges = []
-                for node_idx in self.cc_to_node[cc_idx]:
-                    node = self.nodes[node_idx]
-                    edges += [(node_idx,c) for c in node["conn"]]
+                for node_idx in self.cc_to_nodes[cc_idx]:
+                    if t_mask[node_idx]:
+                        for c in self.nodes[node_idx]["conn"]:
+                            if t_mask[c]:
+                                edges.append((node_idx,c))
                 edges_x1_x2_nan = []
                 edges_y1_y2_nan = []
                 for idx1,idx2 in edges:
-                    if self.nodes[idx1]["timestep"]<=max_time and self.nodes[idx2]["timestep"]<=max_time:
-                        x1,y1 = self.nodes[idx1]["x"],self.nodes[idx1]["y"]
-                        x2,y2 = self.nodes[idx2]["x"],self.nodes[idx2]["y"]
-                        edges_x1_x2_nan += [x1,x2,np.nan]
-                        edges_y1_y2_nan += [y1,y2,np.nan]
+                    x1,y1 = self.nodes[idx1]["x"],self.nodes[idx1]["y"]
+                    x2,y2 = self.nodes[idx2]["x"],self.nodes[idx2]["y"]
+                    edges_x1_x2_nan += [x1,x2,np.nan]
+                    edges_y1_y2_nan += [y1,y2,np.nan]
                 plt.plot(edges_x1_x2_nan,edges_y1_y2_nan,".-",color=color[cc_idx])
-        t_mask = [n["timestep"]<=max_time for n in self.nodes]
-        XY_growing = self.XY[np.logical_and([n["is_growing"] for n in self.nodes],t_mask)]
-        plt.plot(XY_growing[:,0],XY_growing[:,1],"o",color="green",markerfacecolor='none',linewidth=1)
+        XY_recent = self.XY[np.logical_and([n["t"]+10>=t for n in self.nodes],t_mask)]
+        plt.plot(XY_recent[:,0],XY_recent[:,1],"o",color="green",markerfacecolor='none',linewidth=1)
         XY_root = self.XY[np.logical_and([n["root"] for n in self.nodes],t_mask)]
         plt.plot(XY_root[:,0],XY_root[:,1],"o",color="red",markerfacecolor='none',markersize=10)
 
-    def default_find_conn_func(self,dist,t_now,t):
-        mod_dist = dist+0.0*self.radius*(t_now-t-1)
-        if any(mod_dist<self.radius*3+2):
-            return [np.argmin(mod_dist)]
+    def default_find_conn_func(self,xy,nodes,node,r):
+        dist = np.linalg.norm(xy-np.array([node["x"],node["y"]]),axis=1)
+        t = np.array([n["t"] for n in nodes if n["active"]])
+        t_now = node["t"]
+        mod_dist = dist#-5.0*self.radius*(1-soft_threshold(t_now-t-1,0,10,3))
+        active_idx = np.array([n["idx"] for n in nodes if n["active"]])
+        mod_dist = mod_dist[active_idx]
+        if any(mod_dist<r*3+2):
+            return [active_idx[np.argmin(mod_dist)]]
         else:
             return []
         
     def default_binarize_func(self,frame):
-        return scipy.ndimage.binary_opening(frame>0.15,structure=np.ones((2,2)),iterations=1)
+        return scipy.ndimage.binary_opening(frame>self.threshold,structure=np.ones((2,2)),iterations=1)
     
     def mask_out_func(self,radius=None):
         if radius is None:
@@ -261,21 +273,29 @@ class FiberGraph:
         return mask
 
     def process_frame(self,frame,t):
+        if len(self.nodes)>0:
+            Y = np.round(self.XY[:,1]).astype(int)
+            X = np.round(self.XY[:,0]).astype(int)
+            node_is_bad = np.logical_not(self.binarize_func(frame)[Y,X])
+            nodes_for_removal = []
+            for i in range(len(self.nodes)):
+                n = self.nodes[i]
+                if node_is_bad[i]:
+                    self.nodes[i]["bad_counter"] += 1
+                    if n["bad_counter"]==3 and len(n["conn"])<=1:
+                        nodes_for_removal.append(i)
+                else:
+                    n["bad_counter"] = 0
+            if len(nodes_for_removal)<10:
+                for i in nodes_for_removal:
+                    self.nodes[i]["active"] = False
+                    self.nodes[i]["active_t"][1] = t
+            else:
+                for i in nodes_for_removal:
+                    self.nodes[i]["bad_counter"] -= 1
         mask_out = self.mask_out_func()
         BW = self.binarize_func(frame*mask_out)
         maxima = strict_local_max(frame*BW)
-        if t>0 and np.sum(maxima)>0 and False:
-            plt.figure()
-            plt.subplot(221)
-            plt.imshow(frame)
-            plt.subplot(222)
-            plt.imshow(frame*BW)
-            plt.subplot(223)
-            plt.imshow(maxima)
-            plt.subplot(224)
-            plt.imshow(mask_out)
-            print(t,np.sum(maxima))
-            assert 1<0
         Y,X = np.where(maxima)
         m_vals = frame[Y,X]
         m_order = np.argsort(m_vals)[::-1]
@@ -313,7 +333,7 @@ def inspect_fiber_vol(V, cmap=plt.cm.gray, vmin = None, vmax = None, fiber_graph
         if fiber_graph is not None:
             for line in ax.lines:
                 line.remove()
-            fiber_graph.plot(max_time=z,**fiber_plot_kwargs)
+            fiber_graph.plot(t=z,**fiber_plot_kwargs)
         ax.set_title(f'slice z={z}/{Z}')
         fig.canvas.draw()
 
@@ -330,5 +350,6 @@ def inspect_fiber_vol(V, cmap=plt.cm.gray, vmin = None, vmax = None, fiber_graph
     if vmax is None:
         vmax = np.max(V)
     ax.imshow(V[z], cmap=cmap, vmin=vmin, vmax=vmax)
+    fiber_graph.plot(t=z,**fiber_plot_kwargs)
     ax.set_title(f'slice z={z}/{Z}')
     fig.canvas.mpl_connect('key_press_event', key_press)
