@@ -6,7 +6,9 @@ import jlc
 from jlc.voltools import arrow_navigation
 from collections import OrderedDict
 from mpl_toolkits.mplot3d import axes3d
-
+import os
+import matplotlib
+from PIL import Image
 
 def gaussian_filter_no_border(input,sigma,**kwargs):
     kwargs['mode'] = 'constant'
@@ -269,10 +271,14 @@ class FiberGraph:
             #show in the t=0 plane
             ax.imshow(image,extent=[0,image.shape[1],image.shape[0],0],alpha=0.5)
 
-    def plot(self,mpl_colors=True,color=None,plot_cc=None,t=None):
+    def plot(self,mpl_colors=True,color=None,plot_cc=None,t=None,plot_node_idx=None,show_root=False,show_grow=False,lw=1,ms=5):
         if t is None:
             t = np.max([n["t"] for n in self.nodes])
         t_mask = [n["active_t"][0]<=t<=n["active_t"][1] for n in self.nodes]
+        if plot_node_idx is not None:
+            for i in range(len(self.nodes)):
+                if i not in plot_node_idx:
+                    t_mask[i] = False
         color,plot_cc = self.get_colors(mpl_colors=mpl_colors,color=color,plot_cc=plot_cc)
 
         for cc_idx in range(len(self.cc_to_nodes)):
@@ -290,21 +296,22 @@ class FiberGraph:
                     x2,y2 = self.nodes[idx2]["x"],self.nodes[idx2]["y"]
                     edges_x1_x2_nan += [x1,x2,np.nan]
                     edges_y1_y2_nan += [y1,y2,np.nan]
-                plt.plot(edges_x1_x2_nan,edges_y1_y2_nan,".-",color=color[cc_idx])
-        XY_recent = self.XY[np.logical_and([n["t"]+10>=t for n in self.nodes],t_mask)]
-        plt.plot(XY_recent[:,0],XY_recent[:,1],"o",color="green",markerfacecolor='none',linewidth=1)
-        XY_root = self.XY[np.logical_and([n["root"] for n in self.nodes],t_mask)]
-        plt.plot(XY_root[:,0],XY_root[:,1],"o",color="red",markerfacecolor='none',markersize=10)
+                plt.plot(edges_x1_x2_nan,edges_y1_y2_nan,".-",color=color[cc_idx],linewidth=lw,markersize=ms)
+        if show_grow:
+            XY_recent = self.XY[np.logical_and([n["t"]+10>=t for n in self.nodes],t_mask)]
+            plt.plot(XY_recent[:,0],XY_recent[:,1],"o",color="green",markerfacecolor='none',linewidth=1)
+        if show_root:
+            XY_root = self.XY[np.logical_and([n["root"] for n in self.nodes],t_mask)]
+            plt.plot(XY_root[:,0],XY_root[:,1],"o",color="red",markerfacecolor='none',markersize=10)
 
-    def default_find_conn_func(self,xy,nodes,node,growing_reward=3):
+    def default_find_conn_func(self,xy,nodes,node,growing_reward=3,recent_reward=3,threshold=8,t_diff_threshold=20):
         dist = np.linalg.norm(xy-np.array([node["x"],node["y"]]),axis=1)
         mod_dist = dist
-        active_idx = np.array([n["idx"] for n in nodes if n["active"]])
-        mod_dist = mod_dist[active_idx]
-        growing_idx = np.array([k for (k,i) in enumerate(active_idx) if nodes[i]["growing"]])
-        mod_dist[growing_idx] -= growing_reward
-        if any(mod_dist<8):
-            return [active_idx[np.argmin(mod_dist)]]
+        mod_dist -= recent_reward*(1-soft_threshold(np.array([node["t"]-n["t"] for n in nodes]),1,t_diff_threshold))
+        mod_dist -= growing_reward*np.array([n["growing"] for n in nodes])
+        mod_dist += 1e10*np.array([not n["active"] for n in nodes])
+        if any(mod_dist<threshold):
+            return [np.argmin(mod_dist)]
         else:
             return []
         
@@ -487,6 +494,13 @@ class FiberGraph:
                 if len(path)>=min_len:
                     paths.append(path)
                     paths_cc.append(cc_idx)
+        #split paths so they are ordered in time
+        new_paths = []
+        for i in range(len(paths)):
+            path_i = paths[i]
+            time_path_i = np.array([self.nodes[j]["t"] for j in paths[i]])
+            new_paths += [p for p in longest_time_seq(time_path_i,idx=paths[i]) if len(p)>=min_len]
+        paths = new_paths
         n = len(paths)
         print("found n="+str(n)+" candidate paths with len>="+str(min_len))
         path_mean_min_dist = np.zeros(n)
@@ -509,6 +523,7 @@ class FiberGraph:
         for path in paths:
             path_XY = self.XY[path]
             path_time = np.array([abs(self.nodes[path[i]]["t"]-self.nodes[path[i+1]]["t"]) for i in range(len(path)-1)])
+            path_time[path_time<1] = 1
             path_dist = np.linalg.norm(path_XY[1:]-path_XY[:-1],axis=1)
             growth_rate.append((path_dist,path_time))
             len_of_long_paths += np.sum(path_dist)
@@ -542,7 +557,44 @@ class FiberGraph:
                  "avg_growth_rate": avg_growth_rate,
                  "high_dens_ratio": high_dens_ratio}
         return stats, growth_rate, paths
-    
+
+def longest_time_seq(time,idx=None):
+    if idx is None:
+        idx = np.arange(len(time))
+
+    longest_seq = []
+    k = 0
+    for _ in range(len(time)):
+        longest_seq.append([idx[k]])
+        time_goes_forward = None
+        num_same_in_a_row = 0
+        for j in range(k+1,len(time)):
+            if time_goes_forward is None:
+                if time[j] == time[k]:
+                    longest_seq[-1].append(idx[j])
+                else:
+                    time_goes_forward = time[j] > time[k]
+                    longest_seq[-1].append(idx[j])
+            else:
+                if time[j] == time[j-1]:
+                    num_same_in_a_row += 1
+                    longest_seq[-1].append(idx[j])
+                elif time[j] > time[j-1] and time_goes_forward:
+                    num_same_in_a_row = 0
+                    longest_seq[-1].append(idx[j])
+                elif time[j] < time[j-1] and not time_goes_forward:
+                    num_same_in_a_row = 0
+                    longest_seq[-1].append(idx[j])
+                else:
+                    break
+        if not time_goes_forward:
+            longest_seq[-1] = longest_seq[-1][::-1]
+        if j == len(time) - 1:
+            break
+        k = j - num_same_in_a_row-1
+        
+    return longest_seq
+
 def local_max(frame):
     return scipy.ndimage.maximum_filter(frame,size=(3,3)) == frame
 
@@ -585,8 +637,10 @@ def laplace(x,s1=0.75,s2=1.5,clip0=True):
         x[x<0] = 0
     return x
 
-def filter_vol(vol,s1 = 0.75, s2 = 1.5, strict_max_filter=True):
+def filter_vol(vol,s1 = 0.75, s2 = 1.5, strict_max_filter=True,only_median=False):
     vol = scipy.ndimage.median_filter(vol, size=(9,1,1), mode='mirror')
+    if only_median:
+        return vol
     vol = np.maximum(norm_quantile(laplace(vol,s1,s2),0.01)*soft_threshold(vol,0.08,0.12),soft_threshold(vol,0.5,0.75))
     if strict_max_filter:
         kernel = (10**np.linspace(-4,-2,3)).tolist()
@@ -643,8 +697,6 @@ def find_conn2(xy,nodes,node,r,upper_limit=15,at_most_prev_nodes=10,at_most_prev
             speed = 0
         #cost formula
         cost.append(dist[i]*(1+1.0*speed)+1.0*angle)
-    if node["x"]==104 and node["y"]==36:
-        print(cost)
     if any([c<r*3+4 for c in cost]):
         return [growing_index[np.argmin(cost)]]
     else:
@@ -680,3 +732,195 @@ def distance_transform_upscale(imsize,paths,XY,upscale=4):
     dist_big = scipy.ndimage.distance_transform_edt(dist_big)/upscale
     dist = cv2.resize(dist_big,imsize[::-1],interpolation=cv2.INTER_AREA)
     return dist
+
+
+def create_fiber_video(vol,fiber_graph,frames=None,plot_kwargs={},tmp_folder="./video/",vmin=0,vmax=0.5,pixel_mult=1,save_name_override=None):
+    if save_name_override is not None:
+        assert len(frames)==1
+    old_backend = matplotlib.get_backend()
+    #set to agg
+    matplotlib.use('Qt5Agg')
+    if frames is None:
+        frames = vol.shape[0]
+    imsize = vol.shape[1:]
+    os.makedirs(tmp_folder,exist_ok=True)
+    
+    if isinstance(frames,int):
+        r = range(frames)
+    else:
+        r = frames
+    for t in r:
+        fig = plt.figure(dpi=100,frameon=False)
+        ax = plt.Axes(fig, [0., 0., 1., 1.])
+        ax.set_axis_off()
+        ax.imshow(vol[0],cmap="gray",aspect='auto',vmin=vmin,vmax=vmax)
+        fig.add_axes(ax)
+        fig.set_size_inches(imsize[1]*pixel_mult/100,imsize[0]*pixel_mult/100)
+        fig.subplots_adjust(left=0,right=1,bottom=0,top=1)
+        ax.images[0].set_array(vol[t])
+        fiber_graph.plot(t=t,**plot_kwargs)
+        ax.set_xlim(0,imsize[1])
+        ax.set_ylim(0,imsize[0])
+        ax.images[0].set_interpolation('nearest')
+        plt.savefig(tmp_folder+"frame_"+str(t)+".png",bbox_inches="tight",pad_inches=0)
+        #remove the image from the axis
+        plt.close("all")
+    matplotlib.use(old_backend)
+    if save_name_override:
+        loadname = tmp_folder+"/frame_"+str(t)+".png"
+        savename = tmp_folder+save_name_override
+        if os.path.exists(savename): os.remove(savename)
+        os.rename(loadname,savename)
+
+
+def make_dist_time_plot(paths,growth_rate,fiber_graph,add_start_time = True,plot=True,
+                        save_fig=False,save_csv=False,
+                        save_fig_name="dist_vs_time.png",
+                        save_csv_name="dist_vs_time.csv"):
+    if add_start_time:
+        start_time = []
+        for i in range(len(paths)):
+            idx = paths[i][0]
+            t = fiber_graph.nodes[idx]["t"]
+            start_time.append(t)
+    else:
+        start_time = [0]*len(paths)
+
+    plt.figure(figsize=(14,8))  
+    csv_data = np.zeros((0,3))
+    for i,(dist,time) in enumerate(growth_rate):
+        x,y = np.cumsum(time),np.cumsum(dist)
+        x,y = [0]+x.tolist(),[0]+y.tolist()
+        x = [start_time[i]+xi for xi in x]
+        if plot or save_fig:
+            plt.text(x[-1],y[-1],str(i))
+            plt.plot(x,y,"o-")
+        if save_csv:
+            csv_data = np.concatenate((csv_data,np.array([x,y,[i]*len(x)]).T))
+    if plot or save_fig:
+        plt.xlabel("time from start of fiber (frames)")
+        plt.ylabel("distance covered")
+        plt.show()
+        if save_fig:
+            plt.savefig(save_fig_name,dpi=200)
+    if not plot and save_fig:
+        plt.close()
+    if save_csv:
+        np.savetxt(save_csv_name,csv_data,delimiter=",",header="time,distance,fiber_number",fmt="%d,%f,%d")
+
+def plot_mean_growth_rate(fiber_graph,plot_conf=False,save_fig=False,save_fig_name="mean_growth_rate.png",close_fig=False):
+    max_t = np.max([n["t"] for n in fiber_graph.nodes])
+    growth_rate = [[] for _ in range(max_t)]
+    t = np.arange(max_t)
+    for t_i in t:
+        for edge in fiber_graph.edges:
+            if fiber_graph.nodes[edge[0]]["t"]<=t_i<=fiber_graph.nodes[edge[1]]["t"]:
+                xy1 = np.array([fiber_graph.nodes[edge[0]]["x"],fiber_graph.nodes[edge[0]]["y"]])
+                xy2 = np.array([fiber_graph.nodes[edge[1]]["x"],fiber_graph.nodes[edge[1]]["y"]])
+                dist = np.linalg.norm(xy1-xy2)
+                time = abs(fiber_graph.nodes[edge[0]]["t"]-fiber_graph.nodes[edge[1]]["t"])
+                if time==0:
+                    time = 1
+                growth_rate[t_i].append(dist/time)
+    growth_rate_mean = np.array([np.mean(g) if len(g)>0 else float("nan") for g in growth_rate])
+    growth_rate_n = np.array([len(g) for g in growth_rate])
+    growth_rate_std = np.array([np.std(g) if len(g)>0 else float("nan") for g in growth_rate])
+    plt.plot(t,growth_rate_mean,label="mean growth rate")
+    if plot_conf:
+        t_val = 1.96
+        min_conf = growth_rate_mean-t_val*growth_rate_std/np.sqrt(growth_rate_n)
+        max_conf = growth_rate_mean+t_val*growth_rate_std/np.sqrt(growth_rate_n)
+        plt.fill_between(t,min_conf,max_conf,alpha=0.5,label="95% confidence interval")
+    plt.ylabel("growth rate (pixels/frame)")
+    plt.xlabel("time")
+    plt.ylim(0,None)
+    plt.legend()
+    plt.show()
+    if save_fig:
+        plt.savefig(save_fig_name,dpi=200)
+    if close_fig:
+        plt.close() 
+
+def create_mp4_from_frame_folder(folder,savename="video.mp4",fps=10,delete_frames=False):
+    file0_name = os.listdir(folder)[0]
+    imsize = np.array(plt.imread(folder+file0_name)).shape
+    system_str = ("ffmpeg -r "+str(fps)+
+                  " -f image2 -s "+str(imsize[1])+"x"+str(imsize[0])+
+                  " -i "+folder+
+                  "frame_%d.png -vcodec libx264 -crf 25  -pix_fmt yuv420p "+folder+savename)
+    os.system(system_str)
+    if delete_frames:
+        for f in os.listdir(folder):
+            if f.endswith(".png"):
+                os.remove(folder+f)
+
+def generate_results(i,filenames,no_video=False):
+    name = filenames[i].split("YCsgA_")[-1][:-4]
+    print(name)
+    os.makedirs("./results/"+name,exist_ok=True)
+    vol_vis = jlc.load_tifvol(filenames[i].replace("data","data_processed3")).transpose(0,2,1)
+    vol = jlc.load_tifvol(filenames[i].replace("data","data_filtered3")).transpose(0,2,1)
+
+    fiber_graph = FiberGraph(radius=3,threshold=0.2)
+    fiber_graph.process_vol(vol)
+
+    create_fiber_video(vol,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2},
+                    tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                    save_name_override = "fibers_raw_segment_image.png")
+
+    create_fiber_video(vol_vis,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2},
+                    tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                    save_name_override ="fibers_raw_pretty_image.png")
+
+    fiber_graph.cc_crop()
+    fiber_graph.leaf_crop()
+    fiber_graph.high_dens_crop(get_high_density_mask(vol[-1]))
+    fiber_graph.remove_inactive()
+
+    create_fiber_video(vol,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2},
+                    tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                    save_name_override = "fibers_filtered_segment_image.png")
+
+    create_fiber_video(vol_vis,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2},
+                    tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                    save_name_override ="fibers_filtered_pretty_image.png")
+
+    stats, growth_rate, paths = fiber_graph.estimate_stats(vol_vis[-1]-vol_vis[0].mean(),high_dens_image=get_high_density_mask(vol[-1]),max_dist=0,min_len=8)
+
+    create_fiber_video(vol,fiber_graph,frames=[vol.shape[0]-1],
+                    plot_kwargs={"lw":0.5,"ms":2,"mpl_colors": False, "color": "red", "plot_node_idx": sum(paths,[])},
+                    tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                    save_name_override = "fibers_highconf_segment_image.png")
+
+    create_fiber_video(vol_vis,fiber_graph,frames=[vol.shape[0]-1],
+                    plot_kwargs={"lw":0.5,"ms":2,"mpl_colors": False, "color": "red", "plot_node_idx": sum(paths,[])},
+                    tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                    save_name_override = "fibers_highconf_pretty_image.png")
+
+    make_dist_time_plot(paths,growth_rate,fiber_graph,add_start_time = True,plot=False,save_fig=True,save_csv=True,
+                        save_fig_name="results/"+name+"/dist_vs_time.png",
+                        save_csv_name="results/"+name+"/dist_vs_time.csv")
+
+    make_dist_time_plot(paths,growth_rate,fiber_graph,add_start_time = False,plot=False,save_fig=True,save_csv=False,
+                        save_fig_name="results/"+name+"/dist_vs_time0.png")
+
+    plot_mean_growth_rate(fiber_graph=fiber_graph,save_fig=True,save_fig_name="results/"+name+"/mean_growth_rate.png",plot_conf=True,close_fig=True)
+
+    high_dens_per_t = []
+    for t in range(vol.shape[0]):
+        mask = get_high_density_mask(vol[t])
+        high_dens_per_t.append(mask.mean())
+    np.savetxt("./results/"+name+"/high_dens_per_t.txt",high_dens_per_t,delimiter=",")
+
+    mask = get_high_density_mask(vol[-1])
+    im = vol_vis[-1][None].repeat(3,axis=0)
+    im[0] = mask*0.5+im[0]*(1-mask*0.5)
+    im[1] = im[1]*(1-mask*0.5)
+    im[2] = im[2]*(1-mask*0.5)
+    im = np.clip(im.transpose(1,2,0)*255,0,255).astype(np.uint8)
+    im = Image.fromarray(im)
+    savename = "./results/"+name+"/highconf_pretty_image.png"
+    im.save(savename)
+    if ((i==4)) and (not no_video):
+        create_fiber_video(vol_vis,fiber_graph,tmp_folder="./results/"+name+"/video/",frames=range(vol.shape[0]),plot_kwargs={"lw":0.5,"ms":2})
+        create_mp4_from_frame_folder("./results/"+name+"/video/",delete_frames=True)
