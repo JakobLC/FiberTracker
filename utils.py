@@ -221,8 +221,18 @@ class FiberGraph:
     def __len__(self):
         return len(self.nodes)
 
-    def num_fibers(self):
-        return len(self.cc_to_nodes)
+    def num_fibers(self,t=None):
+        if t is None:
+            return len(self.cc_to_nodes)
+        else:
+            num_fibers = 0
+            for cc in self.cc_to_nodes:
+                for idx in cc:
+                    n = self.nodes[idx]
+                    if n["active_t"][0]<=t<=n["active_t"][1]:
+                        num_fibers += 1
+                        break
+            return num_fibers
     
     def get_colors(self,mpl_colors=True,color=None,plot_cc=None):
         if plot_cc is None:
@@ -271,7 +281,13 @@ class FiberGraph:
             #show in the t=0 plane
             ax.imshow(image,extent=[0,image.shape[1],image.shape[0],0],alpha=0.5)
 
-    def plot(self,mpl_colors=True,color=None,plot_cc=None,t=None,plot_node_idx=None,show_root=False,show_grow=False,lw=1,ms=5):
+    def num_branches(self,t=None):
+        if t is None:
+            return sum([len(n["conn"])>2 for n in self.nodes])
+        else:
+            return sum([len(n["conn"])>2 and n["active_t"][0]<=t<=n["active_t"][1] for n in self.nodes])
+    
+    def plot(self,mpl_colors=True,color=None,plot_cc=None,t=None,plot_node_idx=None,show_root=False,show_grow=False,lw=1,ms=5,circle_branches=False):
         if t is None:
             t = np.max([n["t"] for n in self.nodes])
         t_mask = [n["active_t"][0]<=t<=n["active_t"][1] for n in self.nodes]
@@ -303,6 +319,13 @@ class FiberGraph:
         if show_root:
             XY_root = self.XY[np.logical_and([n["root"] for n in self.nodes],t_mask)]
             plt.plot(XY_root[:,0],XY_root[:,1],"o",color="red",markerfacecolor='none',markersize=10)
+        if circle_branches:
+            branch_idx = []
+            for i in range(len(self.nodes)):
+                if t_mask[i] and len(self.nodes[i]["conn"])>2:
+                    branch_idx.append(i)
+            XY_branch = self.XY[branch_idx]
+            plt.plot(XY_branch[:,0],XY_branch[:,1],"o",color="blue",markerfacecolor='none',markersize=10)
 
     def default_find_conn_func(self,xy,nodes,node,growing_reward=3,recent_reward=3,threshold=8,t_diff_threshold=20):
         dist = np.linalg.norm(xy-np.array([node["x"],node["y"]]),axis=1)
@@ -924,3 +947,29 @@ def generate_results(i,filenames,no_video=False):
     if ((i==4)) and (not no_video):
         create_fiber_video(vol_vis,fiber_graph,tmp_folder="./results/"+name+"/video/",frames=range(vol.shape[0]),plot_kwargs={"lw":0.5,"ms":2})
         create_mp4_from_frame_folder("./results/"+name+"/video/",delete_frames=True)
+
+def generate_results_branching(i,filenames):
+    name = filenames[i].split("YCsgA_")[-1][:-4]
+    print(name)
+    os.makedirs("./results/"+name,exist_ok=True)
+    vol_vis = jlc.load_tifvol(filenames[i].replace("data","data_processed3")).transpose(0,2,1)
+    vol = jlc.load_tifvol(filenames[i].replace("data","data_filtered3")).transpose(0,2,1)
+
+    fiber_graph = FiberGraph(radius=3,threshold=0.2)
+    fiber_graph.process_vol(vol)
+    fiber_graph.cc_crop()
+    fiber_graph.leaf_crop()
+    fiber_graph.high_dens_crop(get_high_density_mask(vol[-1]))
+    fiber_graph.remove_inactive()
+
+    create_fiber_video(vol_vis,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2,"circle_branches": True,"mpl_colors": False, "color": "red"},
+                        tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
+                        save_name_override = "branching.png")
+    
+    num_branches_per_t = []
+    num_fibers_per_t = []
+    for t in range(len(vol)):
+        num_branches_per_t.append(fiber_graph.num_branches(t))
+        num_fibers_per_t.append(fiber_graph.num_fibers(t))
+    np.savetxt("./results/"+name+"/num_fibers_per_t.txt",num_fibers_per_t,fmt="%d")
+    np.savetxt("./results/"+name+"/num_branches_per_t.txt",num_branches_per_t,fmt="%d")
