@@ -20,10 +20,16 @@ def gaussian_filter_no_border(input,sigma,**kwargs):
 
 def estimate_bias_coefs(vol,q=0.1):
     q_coefs = np.array([np.quantile(v,q) for v in vol])
-    q_coefs = q_coefs/np.mean(q_coefs)
+    q_coefs = q_coefs/(np.mean(q_coefs)+1e-12)
     base_mean = vol.mean((1,2))
     y = base_mean/q_coefs
-    (a,b) = np.polyfit(np.arange(len(y)),y,1)
+    try:
+        (a,b) = np.polyfit(np.arange(len(y)),y,1)
+    except:
+        print("polyfit failed")
+        print("y",y)
+        print("q_coefs",q_coefs)
+        print("meanvol",base_mean)  
     y_ideal = a*np.arange(len(y))+b
     coefs = y_ideal/y/q_coefs
     return coefs
@@ -121,28 +127,53 @@ def get_corr_mat(frame1,frame2,translate_search,sigma=0,zerozero_is_neighbours=T
         corr_mat[i1,i2] = sum(zero)/len(zero)
     return corr_mat
     
-def process_vol(filename,smaller=False,reset_origo_on_bad_frame=False,alpha=0.001,transpose=True):
-    vol = jlc.load_tifvol(filename)
-    vol = vol[:,:,:vol.shape[2]//2].astype(float)
+def process_vol(filename,
+                alpha=0.001,
+                smaller=False,
+                reset_origo_on_bad_frame=False,
+                transpose=True,
+                crop_half=True,
+                do_translation=True,
+                do_spatial_bias=True,
+                do_temporal_bias=True):
+    if isinstance(filename,str):
+        vol = jlc.load_tifvol(filename)
+    else:
+        assert isinstance(filename,np.ndarray), "filename must be a string (filename for tiff files) or a numpy array"
+        vol = filename
+    assert len(vol.shape)==3, "vol must be a 3d numpy array, found shape "+str(vol.shape)
+    if crop_half:
+        vol = vol[:,:,:vol.shape[2]//2].astype(float)
     if smaller:
         vol = vol[:,vol.shape[0]//4:vol.shape[0]//4*3,vol.shape[1]//4:vol.shape[1]//4*3]
     if transpose:
         vol = np.transpose(vol,(0,2,1))
     vol = norm_quantile(vol,alpha=alpha,clip=True)
-    coefs = estimate_bias_coefs(vol)
-    vol *= coefs.reshape(-1,1,1)
-    bias = estimate_bias(vol)
-    vol -= bias
-    vol = norm_quantile(vol,alpha=alpha,clip=True)
-    vol,best_translation = norm_translation(vol,reset_origo_on_bad_frame=reset_origo_on_bad_frame)
+    if do_temporal_bias:
+        coefs = estimate_bias_coefs(vol)
+        vol *= coefs.reshape(-1,1,1)
+    if do_spatial_bias:
+        bias = estimate_bias(vol)
+        vol -= bias
+        vol = norm_quantile(vol,alpha=alpha,clip=True)
+    if do_translation:
+        vol,best_translation = norm_translation(vol,reset_origo_on_bad_frame=reset_origo_on_bad_frame)
+    else:
+        best_translation = None
     return vol,best_translation
 
 def soft_threshold(vol,start=0,stop=1,power=1): 
     to_interval = lambda x: np.clip((x-start)/(stop-start),0,1)
     f = lambda x: h(to_interval(x),power)
     return f(vol)
+
 def h(x,p):
     return (x<0.5)*0.5*2**p*x**p+(x>=0.5)*(1-0.5*2**p*(1-x)**p)
+
+def rand_dir():
+    direction = np.random.rand(2) - 0.5
+    direction = direction / (np.linalg.norm(direction) + 1e-12)
+    return direction
 
 def get_disc_2d(r,binarize=True):
     k = r
@@ -152,7 +183,7 @@ def get_disc_2d(r,binarize=True):
     return out
 
 class FiberGraph:
-    def __init__(self, find_conn_func=None, binarize_func=None, image_size=None, radius=3, threshold=0.15):
+    def __init__(self, find_conn_func=None, binarize_func=None, image_size=None, radius=3, threshold=0.15, max_accept_conn_threshold=8):
         self.nodes = []
         self.edges = []
         self.cc_to_nodes = []
@@ -164,6 +195,7 @@ class FiberGraph:
         self.radius = radius
         self.debug = False
         self.threshold = threshold
+        self.max_accept_conn_threshold = max_accept_conn_threshold
         
         if binarize_func is None:
             self.binarize_func = self.default_binarize_func
@@ -342,7 +374,9 @@ class FiberGraph:
             XY_branch = self.XY[np.logical_and([len(n["conn"])>2 for n in self.nodes],t_mask)]
             plt.plot(XY_branch[:,0],XY_branch[:,1],"o",color=colors.get("branches","blue"),markerfacecolor='none',linewidth=sizes["branches"])
 
-    def default_find_conn_func(self,xy,nodes,node,growing_reward=3,recent_reward=3,threshold=8,t_diff_threshold=20):
+    def default_find_conn_func(self,xy,nodes,node,growing_reward=3,recent_reward=3,threshold=None,t_diff_threshold=20):
+        if threshold is None:
+            threshold = self.max_accept_conn_threshold
         dist = np.linalg.norm(xy-np.array([node["x"],node["y"]]),axis=1)
         mod_dist = dist
         mod_dist -= recent_reward*(1-soft_threshold(np.array([node["t"]-n["t"] for n in nodes]),1,t_diff_threshold))
@@ -990,3 +1024,183 @@ def generate_results_branching(i,filenames):
         num_fibers_per_t.append(fiber_graph.num_fibers(t))
     np.savetxt("./results/"+name+"/num_fibers_per_t.txt",num_fibers_per_t,fmt="%d")
     np.savetxt("./results/"+name+"/num_branches_per_t.txt",num_branches_per_t,fmt="%d")
+
+
+
+def positive_min(a,b):
+    """ Computes the minimum of two arrays, but ignores negative 
+    values. If both values are negative, the result is the minimum 
+    """
+    return( (a >= 0) * (b <  0) * a + 
+            (a <  0) * (b >= 0) * b + 
+            (a >= 0) * (b >= 0) * np.minimum(a,b) +
+            (a <  0) * (b <  0) * np.minimum(a,b))
+
+def point_dist_update(min_fiber_dist, point, radius=2, reduction_func=positive_min):
+    H, W = min_fiber_dist.shape
+    y,x = point
+    r = radius
+    x0, x1 = max(0, int(x - r)), min(W, int(x + r + 1))
+    y0, y1 = max(0, int(y - r)), min(H, int(y + r + 1))
+    if x0 >= x1 or y0 >= y1:
+        return min_fiber_dist
+    x_range = np.arange(x0, x1)
+    y_range = np.arange(y0, y1)
+    x_grid, y_grid = np.meshgrid(x_range, y_range)
+    dists = np.sqrt((x_grid - x)**2 + (y_grid - y)**2)
+    min_fiber_dist[y0:y1,x0:x1] = reduction_func(min_fiber_dist[y0:y1,x0:x1], dists)
+    
+    return min_fiber_dist
+    
+def generate_fake_fiber_data(H=100, W=None, num_frames=100,
+                             num_fibers=20, 
+                             fiber_radius=2,
+                             direction_ema_lambda=lambda: np.random.rand(),
+                             new_point_prob=0.2,
+                             new_point_dist=3, 
+                             fiber_mu_sigma=[0.9, 0.15],
+                             background_mu_sigma=[0.05, 0.05],
+                             draw_line_prob=0.5,
+                             allow_repeats=True,
+                             bias_spatial=0,
+                             bias_temporal=0,
+                             bias_translation=0,):
+    if W is None:
+        W = H
+    assert 0<=bias_translation<=1, "bias_translation expected between 0 (no bias) and 1 (maximal bias)"
+    assert 0<=bias_spatial<=1, "bias_spatial expected between 0 (no bias) and 1 (maximal bias)"
+    assert 0<=bias_temporal<=1, "bias_temporal expected between 0 (no bias) and 1 (maximal bias)"
+    # Initialize the fiber mask and the result array
+    min_fiber_dist = -np.ones((H, W))
+    fiber_dist_to_mask = lambda mfd: (mfd >= 0)*soft_threshold(mfd,fiber_radius,0,1)
+    frames = np.zeros((num_frames, H, W))
+
+    # Initialize fibers
+    fibers = []
+    directions = []
+    if allow_repeats:
+        assert new_point_prob < 1, "If repeats are allowed, new_point_prob must be less than 1 or the fibers will never stop growing"
+    for _ in range(num_fibers):
+        # Random initial point
+        point = np.array([np.random.rand()*(H-1), np.random.rand()*(W-1)])
+        fibers.append(point)
+        # Random initial direction
+        directions.append(rand_dir())
+        min_fiber_dist = point_dist_update(min_fiber_dist, point, radius=fiber_radius)
+    
+    for t in range(num_frames):
+        new_points = []
+        fiber_has_failed = np.zeros(num_fibers, dtype=bool)
+        for _ in range(num_fibers*10):
+            if np.all(fiber_has_failed):
+                break
+
+            growing_fiber_idx = np.where(~fiber_has_failed)[0]
+            i = np.random.choice(growing_fiber_idx)
+
+            if np.random.rand() >= new_point_prob:
+                fiber_has_failed[i] = True
+            else:
+                # Calculate new direction
+                demal = direction_ema_lambda() if callable(direction_ema_lambda) else direction_ema_lambda
+                directions[i] = (1 - demal) * rand_dir() + demal * directions[i]
+                directions[i] /= np.linalg.norm(directions[i]+1e-12)
+                p1 = fibers[i]
+                p2 = p1 + new_point_dist * directions[i]
+                fibers[i] = p2
+                new_points.append(p2)
+                if np.random.rand() <= draw_line_prob and draw_line_prob > 0:
+                    # draw lines is just adding points with dist 0.1 pixels between p1 and p2
+                    num_points = int(np.ceil(np.linalg.norm(p2-p1)/0.1))
+                    for j in range(1,num_points):
+                        new_points.append(p1 + j/num_points*(p2-p1))
+        for point in new_points:
+            min_fiber_dist = point_dist_update(min_fiber_dist, point, radius=fiber_radius)
+        new_fiber_mask = fiber_dist_to_mask(min_fiber_dist)
+
+        # Generate frame
+        fiber_intensity = np.random.normal(fiber_mu_sigma[0], fiber_mu_sigma[1], size=(H, W))
+        background_intensity = np.random.normal(background_mu_sigma[0], background_mu_sigma[1], size=(H, W))
+        frames[t] = new_fiber_mask * fiber_intensity + (1 - new_fiber_mask) * background_intensity
+    
+    if bias_translation>0:
+        translation = []
+        current_translation = np.zeros(2)
+        hw = np.array([H,W])
+        for t in range(num_frames):
+            if np.random.rand() < bias_translation:
+                #add normal translation with std 1/100th of the image size
+                current_translation += np.random.normal(0,1/100,size=2)*hw
+            translation.append(current_translation.copy())
+        translation = np.array(translation)
+        frames = np.array([scipy.ndimage.shift(frames[t],-translation[t],mode='mirror') for t in range(num_frames)])
+    if bias_spatial>0:
+        #adds a highlight-like spatial bias
+        X,Y = np.meshgrid(np.linspace(0,1,W),np.linspace(0,1,H))
+        dist_to_center = np.linalg.norm(np.array([X-1/2,Y-1/2]),axis=0)
+        circle_blurred = soft_threshold(dist_to_center,0.5,0.1,1)
+        circle_blurred = scipy.ndimage.gaussian_filter(circle_blurred,(H+W)/10,mode='constant')
+        frames = bias_spatial*circle_blurred[None] + (1-bias_spatial)*frames
+    if bias_temporal>0:
+        #adds a time varying constant bias
+        frames += (np.random.rand(num_frames)*bias_temporal)[:,None,None]
+    return frames
+
+def arrow_navigation(event,z,Z):
+    '''
+    Change z using arrow keys for interactive inspection.
+    @author: vand at dtu dot dk
+    '''
+    if event.key == "up":
+        z = min(z+1,Z-1)
+    elif event.key == 'down':
+        z = max(z-1,0)
+    elif event.key == 'right':
+        z = min(z+10,Z-1)
+    elif event.key == 'left':
+        z = max(z-10,0)
+    elif event.key == 'pagedown':
+        z = min(z+50,Z+1)
+    elif event.key == 'pageup':
+        z = max(z-50,0)
+    return z
+
+
+def inspect_vol(V, cmap=plt.cm.gray, vmin = None, vmax = None):
+    """
+    Inspect volumetric data.
+    
+    Parameters
+    ----------
+    V : 3D numpy array, it will be sliced along axis=0.  
+    cmap : matplotlib colormap
+        The default is plt.cm.gray.
+    vmin and vmax: float
+        color limits, if None the values are estimated from data.
+        
+    Interaction
+    ----------
+    Use arrow keys to change a slice.
+    
+    @author: vand at dtu dot dk
+    """
+    def update_drawing():
+        ax.images[0].set_array(V[z])
+        ax.set_title(f'slice z={z}/{Z}')
+        fig.canvas.draw()
+
+    def key_press(event):
+        nonlocal z
+        z = arrow_navigation(event,z,Z)
+        update_drawing()
+
+    Z = V.shape[0]
+    z = (Z-1)//2
+    fig, ax = plt.subplots()
+    if vmin is None:
+        vmin = np.min(V)
+    if vmax is None:
+        vmax = np.max(V)
+    ax.imshow(V[z], cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(f'slice z={z}/{Z}')
+    fig.canvas.mpl_connect('key_press_event', key_press)
