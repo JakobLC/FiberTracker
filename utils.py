@@ -121,17 +121,19 @@ def get_corr_mat(frame1,frame2,translate_search,sigma=0,zerozero_is_neighbours=T
         corr_mat[i1,i2] = sum(zero)/len(zero)
     return corr_mat
     
-def process_vol(filename,smaller=False,reset_origo_on_bad_frame=False):
+def process_vol(filename,smaller=False,reset_origo_on_bad_frame=False,alpha=0.001,transpose=True):
     vol = jlc.load_tifvol(filename)
     vol = vol[:,:,:vol.shape[2]//2].astype(float)
     if smaller:
         vol = vol[:,vol.shape[0]//4:vol.shape[0]//4*3,vol.shape[1]//4:vol.shape[1]//4*3]
-    vol = norm_quantile(vol,alpha=0.001,clip=True)
+    if transpose:
+        vol = np.transpose(vol,(0,2,1))
+    vol = norm_quantile(vol,alpha=alpha,clip=True)
     coefs = estimate_bias_coefs(vol)
     vol *= coefs.reshape(-1,1,1)
     bias = estimate_bias(vol)
     vol -= bias
-    vol = norm_quantile(vol,alpha=0.001,clip=True)
+    vol = norm_quantile(vol,alpha=alpha,clip=True)
     vol,best_translation = norm_translation(vol,reset_origo_on_bad_frame=reset_origo_on_bad_frame)
     return vol,best_translation
 
@@ -287,7 +289,21 @@ class FiberGraph:
         else:
             return sum([len(n["conn"])>2 and n["active_t"][0]<=t<=n["active_t"][1] for n in self.nodes])
     
-    def plot(self,mpl_colors=True,color=None,plot_cc=None,t=None,plot_node_idx=None,show_root=False,show_grow=False,lw=1,ms=5,circle_branches=False):
+    def plot(self,
+             mpl_colors=True,
+             color=None,
+             plot_cc=None,
+             t=None,
+             plot_node_idx=None,
+             show_root=False,
+             show_recent=False,
+             show_deg_1=False,
+             show_branches=False,
+             dont_plot=False,
+             sizes = {},
+             colors = {}):
+        default_sizes = {"points": 5, "lines": 1, "deg_1": 10, "branches": 10,"recent": 5, "root": 10}
+        sizes = {**default_sizes,**sizes}
         if t is None:
             t = np.max([n["t"] for n in self.nodes])
         t_mask = [n["active_t"][0]<=t<=n["active_t"][1] for n in self.nodes]
@@ -296,36 +312,35 @@ class FiberGraph:
                 if i not in plot_node_idx:
                     t_mask[i] = False
         color,plot_cc = self.get_colors(mpl_colors=mpl_colors,color=color,plot_cc=plot_cc)
-
-        for cc_idx in range(len(self.cc_to_nodes)):
-            if cc_idx in plot_cc:
-                edges = []
-                for node_idx in self.cc_to_nodes[cc_idx]:
-                    if t_mask[node_idx]:
-                        for c in self.nodes[node_idx]["conn"]:
-                            if t_mask[c]:
-                                edges.append((node_idx,c))
-                edges_x1_x2_nan = []
-                edges_y1_y2_nan = []
-                for idx1,idx2 in edges:
-                    x1,y1 = self.nodes[idx1]["x"],self.nodes[idx1]["y"]
-                    x2,y2 = self.nodes[idx2]["x"],self.nodes[idx2]["y"]
-                    edges_x1_x2_nan += [x1,x2,np.nan]
-                    edges_y1_y2_nan += [y1,y2,np.nan]
-                plt.plot(edges_x1_x2_nan,edges_y1_y2_nan,".-",color=color[cc_idx],linewidth=lw,markersize=ms)
-        if show_grow:
+        if not dont_plot:
+            for cc_idx in range(len(self.cc_to_nodes)):
+                if cc_idx in plot_cc:
+                    edges = []
+                    for node_idx in self.cc_to_nodes[cc_idx]:
+                        if t_mask[node_idx]:
+                            for c in self.nodes[node_idx]["conn"]:
+                                if t_mask[c]:
+                                    edges.append((node_idx,c))
+                    edges_x1_x2_nan = []
+                    edges_y1_y2_nan = []
+                    for idx1,idx2 in edges:
+                        x1,y1 = self.nodes[idx1]["x"],self.nodes[idx1]["y"]
+                        x2,y2 = self.nodes[idx2]["x"],self.nodes[idx2]["y"]
+                        edges_x1_x2_nan += [x1,x2,np.nan]
+                        edges_y1_y2_nan += [y1,y2,np.nan]
+                    plt.plot(edges_x1_x2_nan,edges_y1_y2_nan,".-",color=color[cc_idx],linewidth=sizes["lines"],markersize=sizes["points"])
+        if show_deg_1:
+            XY_grow = self.XY[np.logical_and([len(n["conn"])==1 for n in self.nodes],t_mask)]
+            plt.plot(XY_grow[:,0],XY_grow[:,1],"o",color=colors.get("deg_1","green"),markerfacecolor='none',linewidth=sizes["deg_1"])
+        if show_recent:
             XY_recent = self.XY[np.logical_and([n["t"]+10>=t for n in self.nodes],t_mask)]
-            plt.plot(XY_recent[:,0],XY_recent[:,1],"o",color="green",markerfacecolor='none',linewidth=1)
+            plt.plot(XY_recent[:,0],XY_recent[:,1],"o",color=colors.get("recent","green"),markerfacecolor='none',linewidth=sizes["recent"])
         if show_root:
             XY_root = self.XY[np.logical_and([n["root"] for n in self.nodes],t_mask)]
-            plt.plot(XY_root[:,0],XY_root[:,1],"o",color="red",markerfacecolor='none',markersize=10)
-        if circle_branches:
-            branch_idx = []
-            for i in range(len(self.nodes)):
-                if t_mask[i] and len(self.nodes[i]["conn"])>2:
-                    branch_idx.append(i)
-            XY_branch = self.XY[branch_idx]
-            plt.plot(XY_branch[:,0],XY_branch[:,1],"o",color="blue",markerfacecolor='none',markersize=10)
+            plt.plot(XY_root[:,0],XY_root[:,1],"o",color=colors.get("root","red"),markerfacecolor='none',markersize=sizes["root"])
+        if show_branches:
+            XY_branch = self.XY[np.logical_and([len(n["conn"])>2 for n in self.nodes],t_mask)]
+            plt.plot(XY_branch[:,0],XY_branch[:,1],"o",color=colors.get("branches","blue"),markerfacecolor='none',linewidth=sizes["branches"])
 
     def default_find_conn_func(self,xy,nodes,node,growing_reward=3,recent_reward=3,threshold=8,t_diff_threshold=20):
         dist = np.linalg.norm(xy-np.array([node["x"],node["y"]]),axis=1)
@@ -660,11 +675,13 @@ def laplace(x,s1=0.75,s2=1.5,clip0=True):
         x[x<0] = 0
     return x
 
-def filter_vol(vol,s1 = 0.75, s2 = 1.5, strict_max_filter=True,only_median=False):
+def filter_vol(vol,s1 = 0.75, s2 = 1.5, strict_max_filter=True,only_median=False,alpha=0.01,
+               thresh_small=[0.08,0.12],
+               thresh_big=[0.5,0.75]):
     vol = scipy.ndimage.median_filter(vol, size=(9,1,1), mode='mirror')
     if only_median:
         return vol
-    vol = np.maximum(norm_quantile(laplace(vol,s1,s2),0.01)*soft_threshold(vol,0.08,0.12),soft_threshold(vol,0.5,0.75))
+    vol = np.maximum(norm_quantile(laplace(vol,s1,s2),alpha)*soft_threshold(vol,*thresh_small),soft_threshold(vol,*thresh_big))
     if strict_max_filter:
         kernel = (10**np.linspace(-4,-2,3)).tolist()
         kernel = np.array(kernel+[1-2*sum(kernel)]+kernel[::-1])
@@ -962,7 +979,7 @@ def generate_results_branching(i,filenames):
     fiber_graph.high_dens_crop(get_high_density_mask(vol[-1]))
     fiber_graph.remove_inactive()
 
-    create_fiber_video(vol_vis,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2,"circle_branches": True,"mpl_colors": False, "color": "red"},
+    create_fiber_video(vol_vis,fiber_graph,frames=[vol.shape[0]-1],plot_kwargs={"lw":0.5,"ms":2,"show_branches": True,"mpl_colors": False, "color": "red"},
                         tmp_folder="./results/"+name+"/",vmin=0,vmax=1.0,pixel_mult=2,
                         save_name_override = "branching.png")
     
